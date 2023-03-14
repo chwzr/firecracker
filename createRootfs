@@ -1,0 +1,6 @@
+#!/usr/bin/env bash
+
+rm -f build/rootfs/jammy.rootfs.ext4 
+tools/devtool build_rootfs
+cp build/rootfs/jammy.rootfs.ext4 /fc/images/aws/jammy-docker-20G.ext4 
+echo "image copied"

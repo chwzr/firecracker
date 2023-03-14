@@ -1159,7 +1159,7 @@ cmd_build_kernel() {
 #
 cmd_build_rootfs() {
     # Default size for the resulting rootfs image is 300M.
-    SIZE="300M"
+    SIZE="20G"
     FROM_CTR=ubuntu:22.04
     flavour="jammy"
     ROOTFS_DIR=/firecracker/build/rootfs

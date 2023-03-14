@@ -21,5 +21,7 @@ main() {
         ip addr add "$ip/30" dev $dev
         ip link set $dev up
     done
+    ip route add default via 172.16.0.1
+    # echo "nameserver 8.8.8.8" > /etc/resolv.conf
 }
 main
