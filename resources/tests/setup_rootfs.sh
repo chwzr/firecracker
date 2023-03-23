@@ -11,7 +11,7 @@ prepare_fc_rootfs() {
     SSH_DIR="$BUILD_DIR/ssh"
     RESOURCE_DIR="$2"
 
-    packages="udev systemd-sysv openssh-server iproute2 iputils-ping mtr-tiny traceroute docker.io docker-compose curl wget"
+    packages="udev systemd-sysv openssh-server iproute2 iputils-ping mtr-tiny traceroute docker.io docker-compose curl wget fdisk"
 
     # msr-tools is only supported on x86-64.
     # arch=$(uname -m)
@@ -24,8 +24,20 @@ prepare_fc_rootfs() {
     apt reinstall linux-modules-$(uname -r) -y
 
     # Set a hostname.
-    echo "ubuntu-fc-uvm" > "/etc/hostname"
+    echo "dci" > "/etc/hostname"
+    # Add VDB Mount to fstab
+    mkdir -p /data
+    echo "/dev/vdb   /data   ext4   defaults   0   0" >> "/etc/fstab"
 
+    #enable dpkg
+    mkdir -p touch /var/lib/dpkg
+    touch /var/lib/dpkg/status
+
+    # enable legacy iptables for docker
+    apt-get -y update && apt-get -y install iptables arptables ebtables && update-alternatives --set iptables /usr/sbin/iptables-legacy && update-alternatives --set ip6tables /usr/sbin/ip6tables-legacy && update-alternatives --set arptables /usr/sbin/arptables-legacy && update-alternatives --set ebtables /usr/sbin/ebtables-legacy
+
+    # add blank docker-compose file
+    echo 'version: "3.9"' > /root/docker-compose.yml
     # The serial getty service hooks up the login prompt to the kernel console at
     # ttyS0 (where Firecracker connects its serial console).
     # We'll set it up for autologin to avoid the login prompt.
