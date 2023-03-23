@@ -4,3 +4,5 @@ rm -f build/rootfs/jammy.rootfs.ext4
 tools/devtool build_rootfs
 cp build/rootfs/jammy.rootfs.ext4 /fc/images/aws/jammy-docker-20G.ext4 
 echo "image copied"
+
+scp build/rootfs/jammy.rootfs.ext4  root@5.9.156.99:/fc/images/jammy-docker-12G.ext4
