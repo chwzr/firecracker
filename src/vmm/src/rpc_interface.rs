@@ -33,7 +33,9 @@ use crate::vmm_config::mmds::{MmdsConfig, MmdsConfigError};
 use crate::vmm_config::net::{
     NetworkInterfaceConfig, NetworkInterfaceError, NetworkInterfaceUpdateConfig,
 };
-use crate::vmm_config::snapshot::{CreateSnapshotParams, LoadSnapshotParams, SnapshotType};
+use crate::vmm_config::snapshot::{
+    CreateSnapshotParams, LoadSnapshotParams, MemBackendConfig, SnapshotType,
+};
 use crate::vmm_config::vsock::{VsockConfigError, VsockDeviceConfig};
 use crate::vmm_config::{self, RateLimiterUpdate};
 
@@ -94,6 +96,9 @@ pub enum VmmAction {
     /// `BalloonDeviceConfig` as input. This action can only be called before the microVM
     /// has booted.
     SetBalloonDevice(BalloonDeviceConfig),
+    /// Set the memory backend for the VM. The VM will use this backend to handle its
+    /// memory. This action can only be called before the microVM has booted.
+    SetMemoryBackend(MemBackendConfig),
     /// Set the MMDS configuration.
     SetMmdsConfiguration(MmdsConfig),
     /// Set the vsock device or update the one that already exists using the
@@ -437,6 +442,7 @@ impl<'a> PrebootApiController<'a> {
             SetBalloonDevice(config) => self.set_balloon_device(config),
             SetVsockDevice(config) => self.set_vsock_device(config),
             SetMmdsConfiguration(config) => self.set_mmds_config(config),
+            SetMemoryBackend(config) => self.set_memory_backend(config),
             StartMicroVm => self.start_microvm(),
             UpdateMachineConfiguration(config) => self.update_machine_config(config),
             SetEntropyDevice(config) => self.set_entropy_device(config),
@@ -461,6 +467,13 @@ impl<'a> PrebootApiController<'a> {
             .get_config()
             .map(VmmData::BalloonConfig)
             .map_err(VmmActionError::BalloonConfig)
+    }
+
+    fn set_memory_backend(&mut self, cfg: MemBackendConfig) -> Result<VmmData, VmmActionError> {
+        self.boot_path = true;
+        self.vm_resources.memory_backend = Some(cfg);
+
+        Ok(VmmData::Empty)
     }
 
     fn insert_block_device(&mut self, cfg: BlockDeviceConfig) -> Result<VmmData, VmmActionError> {
@@ -683,6 +696,7 @@ impl RuntimeApiController {
             | LoadSnapshot(_)
             | PutCpuConfiguration(_)
             | SetBalloonDevice(_)
+            | SetMemoryBackend(_)
             | SetVsockDevice(_)
             | SetMmdsConfiguration(_)
             | SetEntropyDevice(_)

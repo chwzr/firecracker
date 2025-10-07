@@ -27,6 +27,7 @@ use super::request::net::{parse_patch_net, parse_put_net};
 use super::request::snapshot::{parse_patch_vm_state, parse_put_snapshot};
 use super::request::version::parse_get_version;
 use super::request::vsock::parse_put_vsock;
+use super::request::memory_backend::parse_put_memory_backend;
 
 #[derive(Debug)]
 pub(crate) enum RequestAction {
@@ -82,6 +83,7 @@ impl TryFrom<&Request> for ParsedRequest {
                 Ok(ParsedRequest::new_sync(VmmAction::GetFullVmConfig))
             }
             (Method::Get, "machine-config", None) => parse_get_machine_config(),
+            (Method::Put, "memory-backend", Some(body)) => parse_put_memory_backend(body),
             (Method::Get, "mmds", None) => parse_get_mmds(),
             (Method::Get, _, Some(_)) => method_to_error(Method::Get),
             (Method::Put, "actions", Some(body)) => parse_put_actions(body),
