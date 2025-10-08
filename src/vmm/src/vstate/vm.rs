@@ -506,11 +506,12 @@ impl Vm {
                 self.guest_memory().reset_dirty();
             }
         };
-
-        file.flush()
-            .map_err(|err| MemoryBackingFile("flush", err))?;
-        file.sync_all()
-            .map_err(|err| MemoryBackingFile("sync_all", err))
+        // disable flush for performance reasons as these files are only temporary
+        // file.flush()
+        //     .map_err(|err| MemoryBackingFile("flush", err))?;
+        // file.sync_all()
+        //     .map_err(|err| MemoryBackingFile("sync_all", err))
+        Ok(())
     }
 
     /// Register a device IRQ

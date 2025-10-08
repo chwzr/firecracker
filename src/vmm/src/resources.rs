@@ -28,6 +28,7 @@ use crate::vmm_config::machine_config::{
 use crate::vmm_config::metrics::{MetricsConfig, MetricsConfigError, init_metrics};
 use crate::vmm_config::mmds::{MmdsConfig, MmdsConfigError};
 use crate::vmm_config::net::*;
+use crate::vmm_config::snapshot::MemBackendConfig;
 use crate::vmm_config::vsock::*;
 use crate::vstate::memory;
 use crate::vstate::memory::{GuestRegionMmap, MemoryError};
@@ -116,6 +117,8 @@ pub struct VmResources {
     pub boot_timer: bool,
     /// Whether or not to use PCIe transport for VirtIO devices.
     pub pci_enabled: bool,
+    /// When backed by a memory on boot, this should be set
+    pub memory_backend: Option<MemBackendConfig>,
 }
 
 impl VmResources {
@@ -490,6 +493,16 @@ impl VmResources {
             )
         }
     }
+
+    /// Returns the config for the backing memory file
+    pub fn memory_backend(&self) -> Option<MemBackendConfig> {
+        self.memory_backend.clone()
+    }
+
+    /// Sets the backing memory file
+    pub fn set_memory_backend(&mut self, backing_mem_file: MemBackendConfig) {
+        self.memory_backend.get_or_insert(backing_mem_file);
+    }
 }
 
 impl From<&VmResources> for VmmConfig {
@@ -617,6 +630,7 @@ mod tests {
             mmds_size_limit: HTTP_MAX_PAYLOAD_SIZE,
             entropy: Default::default(),
             pci_enabled: false,
+            memory_backend: None,
         }
     }
 
