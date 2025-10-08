@@ -110,6 +110,16 @@ pub struct GuestRegionUffdMapping {
     pub page_size_kib: usize,
 }
 
+/// Describes a descriptor that connects to the memory used by the VM. This could either be
+/// a file descriptor or a UFFD descriptor.
+#[derive(Debug)]
+pub enum MemoryDescriptor {
+    /// A file descriptor that connects to the user fault process.
+    Uffd(Uffd),
+    /// A file descriptor of the backing memory file.
+    File(Arc<File>),
+}
+
 /// Errors related to saving and restoring Microvm state.
 #[derive(Debug, thiserror::Error, displaydoc::Display)]
 pub enum MicrovmStateError {
@@ -367,7 +377,7 @@ pub fn restore_from_snapshot(
     let mem_backend_path = &params.mem_backend.backend_path;
     let mem_state = &microvm_state.vm_state.memory;
 
-    let (guest_memory, uffd) = match params.mem_backend.backend_type {
+    let (guest_memory, memory_descriptor) = match params.mem_backend.backend_type {
         MemBackendType::File => {
             if vm_resources.machine_config.huge_pages.is_hugetlbfs() {
                 return Err(RestoreFromSnapshotGuestMemoryError::File(
@@ -375,26 +385,33 @@ pub fn restore_from_snapshot(
                 )
                 .into());
             }
-            (
+            let (guest_memory_regions, file) =
                 guest_memory_from_file(mem_backend_path, mem_state, track_dirty_pages)
-                    .map_err(RestoreFromSnapshotGuestMemoryError::File)?,
-                None,
+                    .map_err(RestoreFromSnapshotGuestMemoryError::File)?;
+            (
+                guest_memory_regions,
+                Some(MemoryDescriptor::File(Arc::new(file))),
             )
         }
-        MemBackendType::Uffd => guest_memory_from_uffd(
-            mem_backend_path,
-            mem_state,
-            track_dirty_pages,
-            vm_resources.machine_config.huge_pages,
-        )
-        .map_err(RestoreFromSnapshotGuestMemoryError::Uffd)?,
+        MemBackendType::Uffd => {
+            let (guest_memory_regions, uffd) = guest_memory_from_uffd(
+                mem_backend_path,
+                mem_state,
+                track_dirty_pages,
+                vm_resources.machine_config.huge_pages,
+            )
+            .map_err(RestoreFromSnapshotGuestMemoryError::Uffd)?;
+
+            (guest_memory_regions, uffd.map(MemoryDescriptor::Uffd))
+        }
     };
+
     builder::build_microvm_from_snapshot(
         instance_info,
         event_manager,
         microvm_state,
         guest_memory,
-        uffd,
+        memory_descriptor,
         seccomp_filters,
         vm_resources,
     )
@@ -443,61 +460,114 @@ fn guest_memory_from_file(
     mem_file_path: &Path,
     mem_state: &GuestMemoryState,
     track_dirty_pages: bool,
-) -> Result<Vec<GuestRegionMmap>, GuestMemoryFromFileError> {
-    let mem_file = File::open(mem_file_path)?;
-    let guest_mem = memory::snapshot_file(mem_file, mem_state.regions(), track_dirty_pages)?;
-    Ok(guest_mem)
+) -> Result<(Vec<GuestRegionMmap>, File), GuestMemoryFromFileError> {
+    let mem_file = OpenOptions::new()
+        .write(true)
+        .read(true)
+        .open(mem_file_path)?;
+
+    let guest_mem_regions = memory::snapshot_file(
+        mem_file.try_clone()?,
+        mem_state.regions(),
+        track_dirty_pages,
+    )?;
+
+    Ok((guest_mem_regions, mem_file))
 }
 
 /// Error type for [`guest_memory_from_uffd`]
 #[derive(Debug, thiserror::Error, displaydoc::Display)]
 pub enum GuestMemoryFromUffdError {
+    /// Failed to load guest memory: {0}
+    File(std::io::Error),
     /// Failed to restore guest memory: {0}
     Restore(#[from] MemoryError),
-    /// Failed to UFFD object: {0}
+    /// Failed to connect to UFFD Handler: {0}
+    UdsConnection(#[from] std::io::Error),
+    /// Failed to receive memfd: {0}
+    ReceiveMemfdError(kvm_ioctls::Error),
+    /// No memfd received
+    NoMemFdReceived,
+    /// Failed to deserialize memory: {0}
+    DeserializeMemory(MemoryError),
+    /// Failed to create UFFD: {0}
     Create(userfaultfd::Error),
-    /// Failed to register memory address range with the userfaultfd object: {0}
-    Register(userfaultfd::Error),
-    /// Failed to connect to UDS Unix stream: {0}
-    Connect(#[from] std::io::Error),
-    /// Failed to sends file descriptor: {0}
-    Send(#[from] vmm_sys_util::errno::Error),
+    /// Failed to send UFFD: {0}
+    UffdSend(kvm_ioctls::Error),
 }
 
 fn guest_memory_from_uffd(
     mem_uds_path: &Path,
     mem_state: &GuestMemoryState,
     track_dirty_pages: bool,
-    huge_pages: HugePageConfig,
+    _huge_pages: HugePageConfig,
 ) -> Result<(Vec<GuestRegionMmap>, Option<Uffd>), GuestMemoryFromUffdError> {
-    let (guest_memory, backend_mappings) =
-        create_guest_memory(mem_state, track_dirty_pages, huge_pages)?;
+    use std::io::Read;
 
-    let mut uffd_builder = UffdBuilder::new();
+    let mut socket = UnixStream::connect(mem_uds_path)?;
 
-    // We only make use of this if balloon devices are present, but we can enable it unconditionally
-    // because the only place the kernel checks this is in a hook from madvise, e.g. it doesn't
-    // actively change the behavior of UFFD, only passively. Without balloon devices
-    // we never call madvise anyway, so no need to put this into a conditional.
-    uffd_builder.require_features(FeatureFlags::EVENT_REMOVE);
+    let mut buf = [0u8; 8];
+    let (_, memfd) = socket
+        .recv_with_fd(&mut buf)
+        .map_err(|e| std::io::Error::from_raw_os_error(e.errno()))?;
 
-    let uffd = uffd_builder
-        .close_on_exec(true)
-        .non_blocking(true)
+    if memfd.is_none() {
+        return Err(GuestMemoryFromUffdError::NoMemFdReceived);
+    }
+
+    let memfd = memfd.unwrap();
+
+    let guest_mem_regions = memory::snapshot_file(memfd, mem_state.regions(), track_dirty_pages)
+        .map_err(GuestMemoryFromUffdError::DeserializeMemory)?;
+
+    let uffd = UffdBuilder::new()
+        .require_features(
+            FeatureFlags::EVENT_REMOVE
+                | FeatureFlags::EVENT_REMAP
+                | FeatureFlags::EVENT_FORK
+                | FeatureFlags::EVENT_UNMAP
+                | FeatureFlags::MISSING_SHMEM
+                | FeatureFlags::PAGEFAULT_FLAG_WP,
+        )
         .user_mode_only(false)
+        .non_blocking(true)
         .create()
         .map_err(GuestMemoryFromUffdError::Create)?;
 
-    for mem_region in guest_memory.iter() {
-        uffd.register(mem_region.as_ptr().cast(), mem_region.size() as _)
-            .map_err(GuestMemoryFromUffdError::Register)?;
+    let mut backend_mappings = Vec::with_capacity(guest_mem_regions.len());
+    let mut offset = 0;
+    let page_size = 4096; // Standard 4K page size
+    for mem_region in &guest_mem_regions {
+        let host_base_addr = mem_region.as_ptr();
+        let size = mem_region.size();
+
+        #[allow(deprecated)]
+        backend_mappings.push(GuestRegionUffdMapping {
+            base_host_virt_addr: host_base_addr as u64,
+            size,
+            offset,
+            page_size,
+            page_size_kib: page_size,
+        });
+        offset += size as u64;
     }
 
-    send_uffd_handshake(mem_uds_path, &backend_mappings, &uffd)?;
+    // This is safe to unwrap() because we control the contents of the vector
+    // (i.e GuestRegionUffdMapping entries).
+    let backend_mappings = serde_json::to_string(&backend_mappings).unwrap();
 
-    Ok((guest_memory, Some(uffd)))
+    socket
+        .send_with_fd(backend_mappings.as_bytes(), uffd.as_raw_fd())
+        .map_err(GuestMemoryFromUffdError::UffdSend)?;
+
+    // Wait for UFFD to be ready.
+    let mut buf = [0; 2];
+    socket.read_exact(&mut buf)?;
+
+    Ok((guest_mem_regions, Some(uffd)))
 }
 
+#[allow(dead_code)]
 fn create_guest_memory(
     mem_state: &GuestMemoryState,
     track_dirty_pages: bool,
@@ -521,6 +591,7 @@ fn create_guest_memory(
     Ok((guest_memory, backend_mappings))
 }
 
+#[allow(dead_code)]
 fn send_uffd_handshake(
     mem_uds_path: &Path,
     backend_mappings: &[GuestRegionUffdMapping],
@@ -531,40 +602,44 @@ fn send_uffd_handshake(
     let backend_mappings = serde_json::to_string(backend_mappings).unwrap();
 
     let socket = UnixStream::connect(mem_uds_path)?;
-    socket.send_with_fd(
-        backend_mappings.as_bytes(),
-        // In the happy case we can close the fd since the other process has it open and is
-        // using it to serve us pages.
-        //
-        // The problem is that if other process crashes/exits, firecracker guest memory
-        // will simply revert to anon-mem behavior which would lead to silent errors and
-        // undefined behavior.
-        //
-        // To tackle this scenario, the page fault handler can notify Firecracker of any
-        // crashes/exits. There is no need for Firecracker to explicitly send its process ID.
-        // The external process can obtain Firecracker's PID by calling `getsockopt` with
-        // `libc::SO_PEERCRED` option like so:
-        //
-        // let mut val = libc::ucred { pid: 0, gid: 0, uid: 0 };
-        // let mut ucred_size: u32 = mem::size_of::<libc::ucred>() as u32;
-        // libc::getsockopt(
-        //      socket.as_raw_fd(),
-        //      libc::SOL_SOCKET,
-        //      libc::SO_PEERCRED,
-        //      &mut val as *mut _ as *mut _,
-        //      &mut ucred_size as *mut libc::socklen_t,
-        // );
-        //
-        // Per this linux man page: https://man7.org/linux/man-pages/man7/unix.7.html,
-        // `SO_PEERCRED` returns the credentials (PID, UID and GID) of the peer process
-        // connected to this socket. The returned credentials are those that were in effect
-        // at the time of the `connect` call.
-        //
-        // Moreover, Firecracker holds a copy of the UFFD fd as well, so that even if the
-        // page fault handler process does not tear down Firecracker when necessary, the
-        // uffd will still be alive but with no one to serve faults, leading to guest freeze.
-        uffd.as_raw_fd(),
-    )?;
+    socket
+        .send_with_fd(
+            backend_mappings.as_bytes(),
+            // In the happy case we can close the fd since the other process has it open and is
+            // using it to serve us pages.
+            //
+            // The problem is that if other process crashes/exits, firecracker guest memory
+            // will simply revert to anon-mem behavior which would lead to silent errors and
+            // undefined behavior.
+            //
+            // To tackle this scenario, the page fault handler can notify Firecracker of any
+            // crashes/exits. There is no need for Firecracker to explicitly send its process ID.
+            // The external process can obtain Firecracker's PID by calling `getsockopt` with
+            // `libc::SO_PEERCRED` option like so:
+            //
+            // let mut val = libc::ucred { pid: 0, gid: 0, uid: 0 };
+            // let mut ucred_size: u32 = mem::size_of::<libc::ucred>() as u32;
+            // libc::getsockopt(
+            //      socket.as_raw_fd(),
+            //      libc::SOL_SOCKET,
+            //      libc::SO_PEERCRED,
+            //      &mut val as *mut _ as *mut _,
+            //      &mut ucred_size as *mut libc::socklen_t,
+            // );
+            //
+            // Per this linux man page: https://man7.org/linux/man-pages/man7/unix.7.html,
+            // `SO_PEERCRED` returns the credentials (PID, UID and GID) of the peer process
+            // connected to this socket. The returned credentials are those that were in effect
+            // at the time of the `connect` call.
+            //
+            // Moreover, Firecracker holds a copy of the UFFD fd as well, so that even if the
+            // page fault handler process does not tear down Firecracker when necessary, the
+            // uffd will still be alive but with no one to serve faults, leading to guest freeze.
+            uffd.as_raw_fd(),
+        )
+        .map_err(|e| {
+            GuestMemoryFromUffdError::File(std::io::Error::from_raw_os_error(e.errno()))
+        })?;
 
     // We prevent Rust from closing the socket file descriptor to avoid a potential race condition
     // between the mappings message and the connection shutdown. If the latter arrives at the UFFD

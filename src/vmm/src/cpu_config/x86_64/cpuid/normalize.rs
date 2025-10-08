@@ -25,6 +25,8 @@ pub enum NormalizeCpuidError {
     ExtendedCacheFeatures(#[from] ExtendedCacheFeaturesError),
     /// Failed to set vendor ID in leaf 0x0: {0}
     VendorId(#[from] VendorIdError),
+    /// Failed to disable async pf
+    DisableAsyncPf,
 }
 
 /// Error type for setting leaf 0 section.
